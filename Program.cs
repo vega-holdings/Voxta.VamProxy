@@ -210,32 +210,14 @@ app.Map("/hub", async context =>
         return;
     }
 
-    // Capture Authorization header from VaM's request
-    string? authToken = null;
-    if (context.Request.Headers.TryGetValue("Authorization", out var authHeader))
-    {
-        authToken = authHeader.ToString();
-        if (authToken.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
-            authToken = authToken.Substring(7); // Extract just the token
-        logger.LogInformation("Captured auth token from VaM request");
-    }
-
     logger.LogInformation("VaM client connecting...");
 
     using var vamSocket = await context.WebSockets.AcceptWebSocketAsync();
     using var voxtaSocket = new ClientWebSocket();
     using var httpClient = new HttpClient();
 
-    // Add auth header to remote Voxta connection
-    if (!string.IsNullOrEmpty(authToken))
-    {
-        voxtaSocket.Options.SetRequestHeader("Authorization", $"Bearer {authToken}");
-        httpClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", authToken);
-    }
-
     string? remoteBaseUrl = null;
     string? clientAudioFolder = null;
-    string? capturedAuthToken = authToken; // Use the HTTP header token
 
     try
     {
@@ -251,52 +233,11 @@ app.Map("/hub", async context =>
         // Proxy messages in both directions
         var vamToVoxta = ProxyMessages(
             vamSocket, voxtaSocket, "VaM→Voxta",
-            msg => ProcessVamToVoxta(msg, ref clientAudioFolder, localAudioFolder, ref capturedAuthToken, logger));
+            msg => ProcessVamToVoxta(msg, ref clientAudioFolder, localAudioFolder, logger));
 
         var voxtaToVam = ProxyMessages(
             voxtaSocket, vamSocket, "Voxta→VaM",
-            async msg =>
-            {
-                var result = await ProcessVoxtaToVam(msg, remoteBaseUrl, clientAudioFolder ?? localAudioFolder, httpClient, audioFiles, cleanupLock, logger);
-
-                // Start mic connection when chat starts - extract sessionId
-                if (msg.Contains("\"$type\":\"chatStarted\"") || msg.Contains("\"$type\": \"chatStarted\""))
-                {
-                    var sessionMatch = System.Text.RegularExpressions.Regex.Match(msg, "\"sessionId\"\\s*:\\s*\"([^\"]+)\"");
-                    if (sessionMatch.Success)
-                    {
-                        currentSessionId = sessionMatch.Groups[1].Value;
-                        logger.LogInformation("Chat started with sessionId: {SessionId}", currentSessionId);
-                        _ = StartMicRecording(remoteBaseUrl, currentSessionId);
-                    }
-                    else
-                    {
-                        logger.LogWarning("Chat started but no sessionId found in message!");
-                    }
-                }
-
-                // Handle recordingRequest - Voxta tells us when to record
-                if (msg.Contains("\"$type\":\"recordingRequest\"") || msg.Contains("\"$type\": \"recordingRequest\""))
-                {
-                    var enabledMatch = System.Text.RegularExpressions.Regex.Match(msg, "\"enabled\"\\s*:\\s*(true|false)");
-                    if (enabledMatch.Success)
-                    {
-                        var enabled = enabledMatch.Groups[1].Value == "true";
-                        if (enabled)
-                        {
-                            logger.LogInformation("Recording requested: START");
-                            micReady = true; // Enable sending audio data
-                        }
-                        else
-                        {
-                            logger.LogInformation("Recording requested: STOP");
-                            micReady = false; // Stop sending audio data
-                        }
-                    }
-                }
-
-                return result;
-            });
+            async msg => await ProcessVoxtaToVam(msg, remoteBaseUrl, clientAudioFolder ?? localAudioFolder, httpClient, audioFiles, cleanupLock, logger));
 
         await Task.WhenAny(vamToVoxta, voxtaToVam);
     }
@@ -374,8 +315,15 @@ async Task ProxyMessages(
     }
 }
 
+// JSON serializer options matching Voxta SDK conventions
+var jsonOptions = new JsonSerializerOptions
+{
+    PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    PropertyNameCaseInsensitive = true
+};
+
 // Process messages from VaM to Voxta (intercept authentication)
-Task<string> ProcessVamToVoxta(string message, ref string? clientAudioFolder, string localAudioFolder, ref string? capturedAuthToken, ILogger logger)
+Task<string> ProcessVamToVoxta(string message, ref string? clientAudioFolder, string localAudioFolder, ILogger logger)
 {
     const char signalREnd = '\x1e';
 
@@ -417,13 +365,7 @@ Task<string> ProcessVamToVoxta(string message, ref string? clientAudioFolder, st
 
                 if (msgType == "authenticate")
                 {
-                    // Capture API key for mic streaming auth
-                    var apiKey = innerMsg?["apiKey"]?.GetValue<string>();
-                    if (!string.IsNullOrEmpty(apiKey))
-                    {
-                        capturedAuthToken = apiKey;
-                        logger.LogDebug("Captured API key for mic streaming");
-                    }
+                    logger.LogInformation("Intercepting VaM authentication message");
 
                     // Intercept authentication to modify capabilities
                     var capabilities = innerMsg?["capabilities"];
@@ -445,7 +387,7 @@ Task<string> ProcessVamToVoxta(string message, ref string? clientAudioFolder, st
                             capabilities["audioOutput"] = "Url";
                             capabilities["audioFolder"] = null;
 
-                            logger.LogInformation("Modified auth: audioOutput LocalFile → Url");
+                            logger.LogInformation("Modified auth: audioOutput LocalFile → Url, audioInput → WebSocketStream");
                         }
                     }
                 }
@@ -465,7 +407,7 @@ Task<string> ProcessVamToVoxta(string message, ref string? clientAudioFolder, st
     return Task.FromResult(processed.ToString());
 }
 
-// Process messages from Voxta to VaM (download audio, rewrite URLs)
+// Process messages from Voxta to VaM using SDK types where possible
 async Task<string> ProcessVoxtaToVam(
     string message,
     string? remoteBaseUrl,
@@ -512,48 +454,72 @@ async Task<string> ProcessVoxtaToVam(
                 var innerMsg = args[0];
                 var msgType = innerMsg?["$type"]?.GetValue<string>();
 
-                // Handle replyChunk and replyGenerating (thinkingSpeechUrl)
-                if (msgType == "replyChunk" || msgType == "replyGenerating")
+                // Log message type for debugging
+                if (msgType != null)
                 {
-                    var audioUrlField = msgType == "replyChunk" ? "audioUrl" : "thinkingSpeechUrl";
-                    var audioUrl = innerMsg?[audioUrlField]?.GetValue<string>();
+                    logger.LogDebug("Received message type: {Type}", msgType);
+                }
 
+                // Handle chatStarted - extract sessionId for mic streaming
+                if (msgType == "chatStarted")
+                {
+                    var sessionId = innerMsg?["sessionId"]?.GetValue<string>();
+                    if (sessionId != null)
+                    {
+                        currentSessionId = sessionId;
+                        logger.LogInformation("Chat started with sessionId: {SessionId}", currentSessionId);
+
+                        if (remoteBaseUrl != null)
+                        {
+                            _ = StartMicRecording(remoteBaseUrl, currentSessionId);
+                        }
+                    }
+                    else
+                    {
+                        logger.LogWarning("Chat started but no sessionId found in message!");
+                    }
+                }
+
+                // Handle recordingRequest - Voxta tells us when to record
+                if (msgType == "recordingRequest")
+                {
+                    var enabled = innerMsg?["enabled"]?.GetValue<bool>() ?? false;
+                    if (enabled)
+                    {
+                        logger.LogInformation("Recording requested: START");
+                        micReady = true;
+                    }
+                    else
+                    {
+                        logger.LogInformation("Recording requested: STOP");
+                        micReady = false;
+                    }
+                }
+
+                // Handle replyChunk - download audio and rewrite URL
+                if (msgType == "replyChunk")
+                {
+                    var audioUrl = innerMsg?["audioUrl"]?.GetValue<string>();
                     if (!string.IsNullOrEmpty(audioUrl))
                     {
-                        // Build full URL if relative
-                        var fullUrl = audioUrl;
-                        if (audioUrl.StartsWith("/") && remoteBaseUrl != null)
-                            fullUrl = remoteBaseUrl + audioUrl;
-
-                        if (fullUrl.StartsWith("http"))
+                        var localPath = await DownloadAndSaveAudio(audioUrl, remoteBaseUrl, localAudioFolder, httpClient, audioFiles, cleanupLock, logger);
+                        if (localPath != null)
                         {
-                            try
-                            {
-                                // Download audio file
-                                var audioData = await httpClient.GetByteArrayAsync(fullUrl);
+                            innerMsg!["audioUrl"] = localPath;
+                        }
+                    }
+                }
 
-                                // Generate local filename
-                                var filename = $"voxta_{Guid.NewGuid()}.wav";
-                                var localPath = Path.Combine(localAudioFolder, filename);
-
-                                // Save locally
-                                await File.WriteAllBytesAsync(localPath, audioData);
-
-                                // Track for cleanup
-                                lock (cleanupLock)
-                                {
-                                    audioFiles.Add((localPath, DateTime.UtcNow));
-                                }
-
-                                // Rewrite URL to local path
-                                innerMsg![audioUrlField] = localPath;
-
-                                logger.LogDebug("Downloaded audio: {Url} → {Path}", fullUrl, localPath);
-                            }
-                            catch (Exception ex)
-                            {
-                                logger.LogError(ex, "Failed to download audio from {Url}", fullUrl);
-                            }
+                // Handle replyGenerating - download thinking speech audio
+                if (msgType == "replyGenerating")
+                {
+                    var thinkingSpeechUrl = innerMsg?["thinkingSpeechUrl"]?.GetValue<string>();
+                    if (!string.IsNullOrEmpty(thinkingSpeechUrl))
+                    {
+                        var localPath = await DownloadAndSaveAudio(thinkingSpeechUrl, remoteBaseUrl, localAudioFolder, httpClient, audioFiles, cleanupLock, logger);
+                        if (localPath != null)
+                        {
+                            innerMsg!["thinkingSpeechUrl"] = localPath;
                         }
                     }
                 }
@@ -571,4 +537,50 @@ async Task<string> ProcessVoxtaToVam(
     }
 
     return processed.ToString();
+}
+
+// Helper to download audio and save locally
+async Task<string?> DownloadAndSaveAudio(
+    string audioUrl,
+    string? remoteBaseUrl,
+    string localAudioFolder,
+    HttpClient httpClient,
+    List<(string, DateTime)> audioFiles,
+    object cleanupLock,
+    ILogger logger)
+{
+    // Build full URL if relative
+    var fullUrl = audioUrl;
+    if (audioUrl.StartsWith("/") && remoteBaseUrl != null)
+        fullUrl = remoteBaseUrl + audioUrl;
+
+    if (!fullUrl.StartsWith("http"))
+        return null;
+
+    try
+    {
+        // Download audio file
+        var audioData = await httpClient.GetByteArrayAsync(fullUrl);
+
+        // Generate local filename
+        var filename = $"voxta_{Guid.NewGuid()}.wav";
+        var localPath = Path.Combine(localAudioFolder, filename);
+
+        // Save locally
+        await File.WriteAllBytesAsync(localPath, audioData);
+
+        // Track for cleanup
+        lock (cleanupLock)
+        {
+            audioFiles.Add((localPath, DateTime.UtcNow));
+        }
+
+        logger.LogDebug("Downloaded audio: {Url} → {Path}", fullUrl, localPath);
+        return localPath;
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "Failed to download audio from {Url}", fullUrl);
+        return null;
+    }
 }
