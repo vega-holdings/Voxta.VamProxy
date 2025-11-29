@@ -201,8 +201,14 @@ void StopMicRecording()
     }
 }
 
-app.Map("/hub", async context =>
+app.Use(async (context, next) =>
 {
+    if (context.Request.Path != "/hub")
+    {
+        await next();
+        return;
+    }
+
     if (!context.WebSockets.IsWebSocketRequest)
     {
         context.Response.StatusCode = 400;
